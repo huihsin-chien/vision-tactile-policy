@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# Stage 0: Post-process data
+echo "Stage 0: post-processing data..."
+python post_process_data.py --tag flip_v2 --action_type right_arm_6DOF_wrench --skip_static_frames
+
+# Stage 1: Train Policy
+echo "Stage 1: training Policy..."
+CUDA_VISIBLE_DEVICES=0 accelerate launch train.py \
+    --config-name=train_diffusion_transformer_real_image_workspace \
+    task=real_flip_image_wrench_dpt_10fps \
+    task.dataset_path=/home/wendi/Desktop/ImplicitRDP/data/flip_v2_zarr \
+    task.name=real_flip_image_wrench_dpt_10fps_v2 \
+    policy.noise_scheduler.prediction_type=v_prediction \
+    logging.mode=online
