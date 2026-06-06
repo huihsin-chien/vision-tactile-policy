@@ -6,7 +6,7 @@ defaults:
   - task: umi_digit_implicitrdp_10fps
   - _self_
 
-name: train_umi_digit_implicitrdp
+name: train_umi_digit_implicitrdp_reactive
 _target_: ImplicitRDP.workspace.train_diffusion_transformer_image_workspace.TrainDiffusionTransformerImageWorkspace
 
 task_name: ${task.name}
@@ -44,13 +44,16 @@ policy:
     global_pool: ''
     n_emb: ${n_emb}
 
-    # TODO (6/6): replace with SparSH ViT for digit_img key.
-    # For now use resnet34 as a trainable baseline for both wrist_rgb and digit_img.
-    model_name: 'resnet34'
+    model_name: 'resnet34'   # wrist_rgb backbone (kept as resnet34)
     pretrained: False
     frozen: False
     feature_aggregation: null
     downsample_ratio: 32
+    # SparSH slow-path encoder for DIGIT tactile images
+    per_key_model_name:
+      digit_img_left:  'sparsh_dino_small'
+      digit_img_right: 'sparsh_dino_small'
+    sparsh_ckpt_path: 'assets/sparsh_ckpts/dino_vitsmall.ckpt'
 
     transforms:
       - type: CenterCrop
@@ -77,6 +80,8 @@ policy:
     time_as_cond: True
     obs_as_cond: True
     n_cond_layers: 0
+    # SparSH: 1 time + 2×49 wrist + 2×196 digit_left + 2×196 digit_right + 2×1 pose = 885
+    max_cond_tokens: 1024
 
   n_emb: ${n_emb}
   horizon: ${horizon}
@@ -172,19 +177,3 @@ hydra:
   sweep:
     dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}
-
-so - 6/4，Fork ImplicitRDP 並定 baseline config。
-    - 建一份乾淨分支。
-    - 改 task config：時間頁率、視覺輸入、觸覺分支。
-    - 先不要加太多新功能，保持 baseline 可回退。
-    - 完成標準是：你可以用固定 config 重現一次訓練入口。
-is this part finished? if not, please continue to write the rest of the code.
-if yes, please show me how to test the training entry point with the fixed config.
-i want to test the training entry point with the fixed config. 
-
-and afterward, is - 6/5，寫 data loader。
-    - 讀入同步後的 gopro、digit、timestamp、robot_state。
-    - 把資料格式固定下來，避免後面每個模組都自己處理。
-    - 完成標準是：loader 能穩定吐出一個 batch。
-  this part finished? if not, please analyze the data loading code now
-  and make a plan for the rest of it.

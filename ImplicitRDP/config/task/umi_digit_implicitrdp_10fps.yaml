@@ -51,10 +51,10 @@ shape_meta:
     # Fast-path: dual-DIGIT PCA embeddings → GRU (replaces wrench, no F/T sensor)
     # Concatenated as input to GRU: (B, T, 32+32=64)
     digit_pca_left:
-      shape: [${task.pca_dim}]
+      shape: [32]   # = pca_dim per sensor
       type: low_dim
     digit_pca_right:
-      shape: [${task.pca_dim}]
+      shape: [32]   # = pca_dim per sensor
       type: low_dim
 
   action:
@@ -77,10 +77,10 @@ model_shape_meta:              # same as shape_meta (rpy_for_rotation: False)
       type: low_dim
   extended_obs:
     digit_pca_left:
-      shape: [${task.pca_dim}]
+      shape: [32]   # = pca_dim per sensor
       type: low_dim
     digit_pca_right:
-      shape: [${task.pca_dim}]
+      shape: [32]   # = pca_dim per sensor
       type: low_dim
   action:
     shape: [7]

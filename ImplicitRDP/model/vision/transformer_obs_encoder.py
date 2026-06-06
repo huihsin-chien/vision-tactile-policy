@@ -66,6 +66,9 @@ class TransformerObsEncoder(ModuleAttrMixin):
             share_rgb_model: bool=False,
             feature_aggregation: str=None,
             downsample_ratio: int=32,
+            # per-key backbone override: {key: 'sparsh_dino_small'}
+            per_key_model_name: dict=None,
+            sparsh_ckpt_path: str=None,
         ):
         """
         Assumes rgb input: B,T,C,H,W
@@ -88,6 +91,8 @@ class TransformerObsEncoder(ModuleAttrMixin):
             num_classes=0            # remove classification layer
         )
         self.model_name = model_name
+        self.per_key_model_name = per_key_model_name or {}
+        self.sparsh_ckpt_path = sparsh_ckpt_path
 
         if frozen:
             assert pretrained
@@ -190,7 +195,14 @@ class TransformerObsEncoder(ModuleAttrMixin):
             if type == 'rgb':
                 rgb_keys.append(key)
 
-                this_model = model if share_rgb_model else copy.deepcopy(model)
+                key_mn = self.per_key_model_name.get(key, model_name)
+                if key_mn.startswith('sparsh_'):
+                    from ImplicitRDP.model.vision.sparsh_vit_wrapper import SparshViTWrapper
+                    assert sparsh_ckpt_path is not None, \
+                        f"sparsh_ckpt_path required for key '{key}' with model '{key_mn}'"
+                    this_model = SparshViTWrapper(sparsh_ckpt_path, frozen=frozen)
+                else:
+                    this_model = model if share_rgb_model else copy.deepcopy(model)
                 key_model_map[key] = this_model
                 
                 # check if we need feature projection
@@ -198,7 +210,7 @@ class TransformerObsEncoder(ModuleAttrMixin):
                     example_img = torch.zeros((1,)+tuple(shape))
                     example_img = transform(example_img)
                     example_feature_map = this_model(example_img)
-                    example_features = self.aggregate_feature(example_feature_map)
+                    example_features = self.aggregate_feature(example_feature_map, key=key)
                     feature_shape = example_features.shape
                     feature_size = feature_shape[-1]
                 proj = nn.Identity()
@@ -239,10 +251,11 @@ class TransformerObsEncoder(ModuleAttrMixin):
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
         )
 
-    def aggregate_feature(self, feature):
+    def aggregate_feature(self, feature, key=None):
         # Return: B, N, C
-        
-        if self.model_name.startswith('vit'):
+        mn = self.per_key_model_name.get(key, self.model_name) if key else self.model_name
+
+        if mn.startswith('vit') or mn.startswith('sparsh_'):
             # vit uses the CLS token
             if self.feature_aggregation == 'cls':
                 return feature[:, [0], :]
@@ -286,7 +299,7 @@ class TransformerObsEncoder(ModuleAttrMixin):
             assert img.shape[1:] == self.key_shape_map[key]
             img = self.key_transform_map[key](img)
             raw_feature = self.key_model_map[key](img)
-            feature = self.aggregate_feature(raw_feature)
+            feature = self.aggregate_feature(raw_feature, key=key)
             emb = self.key_projection_map[key](feature)
             assert len(emb.shape) == 3 and emb.shape[0] == BT and emb.shape[-1] == self.n_emb
             emb = emb.reshape(B,-1,self.n_emb)
