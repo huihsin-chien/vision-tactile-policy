@@ -1,0 +1,190 @@
+# Top-level workspace config: UMI + DIGIT + ImplicitRDP (Reactive Diffusion Transformer)
+# Usage:
+#   python train.py --config-name=train_umi_digit_implicitrdp_workspace
+
+defaults:
+  - task: umi_digit_implicitrdp_10fps
+  - _self_
+
+name: train_umi_digit_implicitrdp
+_target_: ImplicitRDP.workspace.train_diffusion_transformer_image_workspace.TrainDiffusionTransformerImageWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+horizon: 16
+n_obs_steps: 2
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+n_action_steps: ${eval:'${horizon}-${dataset_obs_steps}+1'}
+n_emb: 768
+
+ckpt_path: null
+
+policy:
+  _target_: ImplicitRDP.policy.diffusion_transformer_image_policy.DiffusionTransformerImagePolicy
+  shape_meta: ${task.model_shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon
+
+  obs_encoder:
+    _target_: ImplicitRDP.model.vision.transformer_obs_encoder.TransformerObsEncoder
+    shape_meta: ${task.model_shape_meta}
+    obs_horizon: ${n_obs_steps}
+    global_pool: ''
+    n_emb: ${n_emb}
+
+    # TODO (6/6): replace with SparSH ViT for digit_img key.
+    # For now use resnet34 as a trainable baseline for both wrist_rgb and digit_img.
+    model_name: 'resnet34'
+    pretrained: False
+    frozen: False
+    feature_aggregation: null
+    downsample_ratio: 32
+
+    transforms:
+      - type: CenterCrop
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+
+    use_group_norm: True
+    share_rgb_model: False   # separate backbone for wrist_rgb vs digit_img
+
+  model:
+    _target_: ImplicitRDP.model.diffusion.transformer_for_diffusion.TransformerForDiffusion
+    shape_meta: ${task.model_shape_meta}
+    action_horizon: ${horizon}
+    n_obs_steps: ${n_obs_steps}
+    cond_dim: ${n_emb}
+    n_layer: 7
+    n_head: 4
+    n_emb: ${n_emb}
+    p_drop_emb: 0.0
+    p_drop_attn: 0.1
+    time_as_cond: True
+    obs_as_cond: True
+    n_cond_layers: 0
+
+  n_emb: ${n_emb}
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 5
+  input_pertub: 0.1
+  use_rnn_obs_encoder: True      # enable fast-path DIGIT PCA → GRU
+  rnn_obs_encoder_n_layer: 1
+  rnn_obs_encoder_hidden_dim: 512
+  # GRU input_dim is auto-derived from shape_meta.extended_obs (= task.pca_dim = 32)
+  use_amp_for_inference: False
+  amp_dtype: "bf16"
+
+ema:
+  _target_: ImplicitRDP.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 32       # smaller than original (64) since we have two image inputs now
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+
+optimizer:
+  lr: 3.0e-4
+  weight_decay: 1.0e-6
+  obs_encoder_lr: 3.0e-5
+  obs_encoder_weight_decay: 1.0e-6
+  betas: [0.95, 0.999]
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  pretrained_ckpt_path: null
+  use_amp: False
+  amp_dtype: "bf16"
+  lr_scheduler: cosine
+  lr_warmup_steps: 2000
+  num_epochs: 600
+  gradient_accumulate_every: 1
+  use_ema: True
+  freeze_encoder: False
+  rollout_every: 50
+  checkpoint_every: 10
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: umi_digit_implicitrdp
+  resume: False
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: train_loss
+    mode: min
+    k: 1
+    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+
+so - 6/4，Fork ImplicitRDP 並定 baseline config。
+    - 建一份乾淨分支。
+    - 改 task config：時間頁率、視覺輸入、觸覺分支。
+    - 先不要加太多新功能，保持 baseline 可回退。
+    - 完成標準是：你可以用固定 config 重現一次訓練入口。
+is this part finished? if not, please continue to write the rest of the code.
+if yes, please show me how to test the training entry point with the fixed config.
+i want to test the training entry point with the fixed config. 
+
+and afterward, is - 6/5，寫 data loader。
+    - 讀入同步後的 gopro、digit、timestamp、robot_state。
+    - 把資料格式固定下來，避免後面每個模組都自己處理。
+    - 完成標準是：loader 能穩定吐出一個 batch。
+  this part finished? if not, please analyze the data loading code now
+  and make a plan for the rest of it.

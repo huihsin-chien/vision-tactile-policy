@@ -1,0 +1,160 @@
+# Baseline task config for UMI + dual-DIGIT + ImplicitRDP
+# Sensors: single wrist RGB + two DIGIT tactile sensors (left + right)
+# Policy:  ImplicitRDP (Reactive Diffusion Transformer)
+# FPS:     10 Hz control
+#
+# Zarr key mapping (produced by scripts/zarr_convert.py):
+#   camera0_rgb              → wrist_rgb          (224×224, HWC uint8)
+#   robot0_tactile_left      → digit_img_left     (224×224, HWC uint8)
+#   robot0_tactile_right     → digit_img_right    (224×224, HWC uint8)
+#   eef_pos+rot_aa+gripper   → robot_tcp_pose     (7-dim float32)
+#   same                     → action             (7-dim float32)
+#   PCA(left@64×64,  dim=32) → digit_pca_left     (32-dim float32) ← fast-path
+#   PCA(right@64×64, dim=32) → digit_pca_right    (32-dim float32) ← fast-path
+#
+# Action space (7-dim, no virtual target / stiffness):
+#   action = [eef_xyz(3), eef_axis_angle(3), gripper_width(1)]
+#   virtual_xyz/RPY/stiffness are Flexiv-impedance-specific; not applicable here.
+#   Contact awareness comes from dual-DIGIT fast-path GRU instead.
+
+name: umi_digit_implicitrdp_10fps
+
+# ──────────────────────────────────────────────
+# Shapes
+# ──────────────────────────────────────────────
+image_shape:   [3, 224, 224]
+tactile_shape: [3, 224, 224]
+pca_dim: 32                   # per sensor; total GRU input = pca_dim × 2 = 64
+                              # variance: 8→94.7%, 16→95.4%, 32→96.2% (current 2-demo dataset)
+                              # refit PCA after Phase 3 data collection (~150 demos)
+dataset_path: /home/user/huihsin/voilab/video/umi_digit_zarr
+
+shape_meta:
+  obs:
+    # Visual: wrist RGB camera (slow path)
+    wrist_rgb:
+      shape: ${task.image_shape}
+      type: rgb
+    # Tactile slow path: both DIGIT images → SparSH ViT encoder (one backbone each)
+    digit_img_left:
+      shape: ${task.tactile_shape}
+      type: rgb
+    digit_img_right:
+      shape: ${task.tactile_shape}
+      type: rgb
+    # Proprioception: xyz(3) + axis-angle(3) + gripper_width(1) = 7-dim
+    robot_tcp_pose:
+      shape: [7]
+      type: low_dim
+
+  extended_obs:
+    # Fast-path: dual-DIGIT PCA embeddings → GRU (replaces wrench, no F/T sensor)
+    # Concatenated as input to GRU: (B, T, 32+32=64)
+    digit_pca_left:
+      shape: [${task.pca_dim}]
+      type: low_dim
+    digit_pca_right:
+      shape: [${task.pca_dim}]
+      type: low_dim
+
+  action:
+    # xyz(3) + axis-angle(3) + gripper_width(1) = 7-dim absolute EEF target
+    shape: [7]
+
+model_shape_meta:              # same as shape_meta (rpy_for_rotation: False)
+  obs:
+    wrist_rgb:
+      shape: ${task.image_shape}
+      type: rgb
+    digit_img_left:
+      shape: ${task.tactile_shape}
+      type: rgb
+    digit_img_right:
+      shape: ${task.tactile_shape}
+      type: rgb
+    robot_tcp_pose:
+      shape: [7]
+      type: low_dim
+  extended_obs:
+    digit_pca_left:
+      shape: [${task.pca_dim}]
+      type: low_dim
+    digit_pca_right:
+      shape: [${task.pca_dim}]
+      type: low_dim
+  action:
+    shape: [7]
+
+# ──────────────────────────────────────────────
+# Dataset
+# ──────────────────────────────────────────────
+dataset:
+  _target_: ImplicitRDP.dataset.real_image_tactile_dataset.RealImageTactileDataset
+  shape_meta: ${task.shape_meta}
+  dataset_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${dataset_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${n_obs_steps}
+  obs_temporal_downsample_ratio: 1
+  n_latency_steps: ${n_latency_steps}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  delta_action: False
+  relative_action: False        # absolute EEF targets; single-arm, no left/right naming
+  rpy_for_rotation: False       # axis-angle (3D) in zarr; matrix_actions_to_rpy needs 9D+
+
+# ──────────────────────────────────────────────
+# Image transforms
+# ──────────────────────────────────────────────
+transforms:
+  - type: CenterCrop
+
+# ──────────────────────────────────────────────
+# Env runner (real-robot eval — fill in IPs later)
+# ──────────────────────────────────────────────
+env_runner:
+  _target_: ImplicitRDP.env_runner.real_stable_reactive_runner.RealStableReactiveRunner
+  eval_episodes: 50
+  max_duration_time: 30
+  tcp_action_update_interval: 6
+  gripper_action_update_interval: 6
+  tcp_pos_clip_range:
+    - [-100, -100, -100]
+    - [ 100,  100,  100]
+  tcp_rot_clip_range:
+    - [-100, -100, -100]
+    - [ 100,  100,  100]
+  latency_step: 2
+  gripper_latency_step: 2
+  control_fps: 10
+  n_obs_steps: ${n_obs_steps}
+  obs_temporal_downsample_ratio: 1
+  downsample_extended_obs: False
+  task_name: ${task_name}
+  shape_meta: ${task.shape_meta}
+  use_reactive_transformer: True
+  tcp_ensemble_buffer_params:
+    ensemble_mode: 'new'
+  gripper_ensemble_buffer_params:
+    ensemble_mode: 'new'
+  action_type: 'right_arm_6DOF_virtual_target_stiffness'
+  use_relative_action: ${task.dataset.relative_action}
+  use_rpy_for_rotation: ${task.dataset.rpy_for_rotation}
+  action_interpolation_ratio: 1
+  controller_server_ip: "192.168.x.x"
+  controller_server_port: 8082
+  enable_video_recording: False
+  env_params:
+    robot_server_ip: "192.168.x.x"
+    robot_server_port: 8092
+    device_mapping_server_ip: "127.0.0.1"
+    device_mapping_server_port: 8062
+    data_processing_params:
+      mode: 'single_arm_usb_camera_digit'
+      image_resize_shape: [224, 224]
+      use_6d_rotation: False
+      debug: False
+    max_fps: 10
+    debug: False
