@@ -55,6 +55,45 @@ TACTILE_KEYS = ['robot0_tactile_left', 'robot0_tactile_right']
 OUT_IMG_KEYS = ['digit_img_left', 'digit_img_right']
 OUT_PCA_KEYS = ['digit_pca_left', 'digit_pca_right']
 
+SYNC_SEARCH_S   = 4.0   # search window for sync clamp (seconds)
+SMOOTH_KERNEL   = 15
+CLOSE_RATIO     = 0.50
+OPEN_RATIO      = 0.78
+MIN_CLAMP_FRAMES = 8
+
+
+def detect_task_start(gw_ep: np.ndarray, fps: float = 60.0) -> int:
+    """
+    Find the episode frame where the actual task begins (after sync clamp ends).
+    Uses medfilt onset/offset detection identical to validate_tactile_sync.py.
+    Returns 0 if no sync clamp is detected (safe default = keep all frames).
+    """
+    from scipy.signal import medfilt
+
+    gw = np.array(gw_ep, dtype=float)
+    nans = np.isnan(gw)
+    if nans.any():
+        x = np.arange(len(gw))
+        gw = np.interp(x, x[~nans], gw[~nans])
+
+    gw_s = medfilt(gw, kernel_size=SMOOTH_KERNEL)
+    open_state   = float(np.nanpercentile(gw_s, 85))
+    close_thresh = open_state * CLOSE_RATIO
+    open_thresh  = open_state * OPEN_RATIO
+    n_search     = min(len(gw), int(SYNC_SEARCH_S * fps))
+
+    state, ev_start = "open", None
+    for i in range(n_search):
+        v = gw_s[i]
+        if state == "open" and v < close_thresh:
+            state, ev_start = "closed", i
+        elif state == "closed" and v > open_thresh:
+            dur = i - ev_start
+            if dur >= MIN_CLAMP_FRAMES:
+                return i   # first frame after sync clamp fully opens
+            state, ev_start = "open", None
+    return 0
+
 
 def load_src_zarr(src_path: str):
     store = zarr.ZipStore(src_path, mode='r')
@@ -120,7 +159,8 @@ def fit_pca_single(src_root, src_key: str, out_key: str,
 
 def write_dst_zarr(dst_dir: str, src_root,
                    pca_left: np.ndarray, pca_right: np.ndarray,
-                   episode_ends: np.ndarray):
+                   episode_ends: np.ndarray,
+                   keep_indices: np.ndarray | None = None):
     zarr_path = os.path.join(dst_dir, 'replay_buffer.zarr')
     os.makedirs(zarr_path, exist_ok=True)
     print(f"\n[Write] Creating {zarr_path} …")
@@ -132,25 +172,26 @@ def write_dst_zarr(dst_dir: str, src_root,
     meta = root.require_group('meta')
 
     N = int(episode_ends[-1])
+    idx = keep_indices if keep_indices is not None else np.arange(int(src_root['data']['camera0_rgb'].shape[0]))
     print(f"  Total frames: {N}, episodes: {len(episode_ends)}")
 
     # ── wrist RGB ─────────────────────────────────────────────────────
     print("  wrist_rgb …")
-    data.array('wrist_rgb', src_root['data']['camera0_rgb'][:N],
+    data.array('wrist_rgb', src_root['data']['camera0_rgb'].oindex[idx],
                chunks=(1, 224, 224, 3), compressor=img_comp, dtype='u1')
 
     # ── DIGIT images (both sensors) ───────────────────────────────────
     for src_key, out_key in zip(TACTILE_KEYS, OUT_IMG_KEYS):
         print(f"  {out_key} (← {src_key}) …")
-        data.array(out_key, src_root['data'][src_key][:N],
+        data.array(out_key, src_root['data'][src_key].oindex[idx],
                    chunks=(1, 224, 224, 3), compressor=img_comp, dtype='u1')
 
     # ── proprioception → robot_tcp_pose (7-dim) ───────────────────────
     print("  robot_tcp_pose …")
     tcp_pose = make_tcp_pose(
-        src_root['data']['robot0_eef_pos'][:N],
-        src_root['data']['robot0_eef_rot_axis_angle'][:N],
-        src_root['data']['robot0_gripper_width'][:N],
+        src_root['data']['robot0_eef_pos'].oindex[idx],
+        src_root['data']['robot0_eef_rot_axis_angle'].oindex[idx],
+        src_root['data']['robot0_gripper_width'].oindex[idx],
     )
     data.array('robot_tcp_pose', tcp_pose, chunks=(N, 7),
                compressor=num_comp, dtype='f4')
@@ -163,7 +204,7 @@ def write_dst_zarr(dst_dir: str, src_root,
     # ── DIGIT PCA embeddings (fast-path GRU input) ────────────────────
     for emb, out_key in zip([pca_left, pca_right], OUT_PCA_KEYS):
         print(f"  {out_key} …")
-        data.array(out_key, emb[:N], chunks=(N, emb.shape[1]),
+        data.array(out_key, emb[idx], chunks=(N, emb.shape[1]),
                    compressor=num_comp, dtype='f4')
 
     # ── episode_ends ──────────────────────────────────────────────────
@@ -196,11 +237,34 @@ def main():
     print(f"Episodes: {len(episode_ends)}, total frames: {N}")
     print(f"episode_ends (fixed): {episode_ends}\n")
 
+    # ── Detect & trim sync clamp frames from each episode ─────────────────
+    # Sync clamp = first close event in gripper_width (within first 4s).
+    # These frames show gripper closing/opening on nothing → not useful for training.
+    gw_all = src_root['data']['robot0_gripper_width'][:, 0]
+    ep_starts_raw = np.concatenate([[0], episode_ends[:-1]])
+    keep_indices = []
+    new_episode_ends = []
+    total_kept = 0
+
+    for ep_idx, (ep_s, ep_e) in enumerate(zip(ep_starts_raw, episode_ends)):
+        gw_ep = gw_all[ep_s:ep_e]
+        task_start = detect_task_start(gw_ep)
+        kept = list(range(int(ep_s + task_start), int(ep_e)))
+        trimmed = task_start
+        print(f"  ep{ep_idx}: {int(ep_e - ep_s)} frames  →  trim first {trimmed} (sync clamp)  →  keep {len(kept)} frames")
+        keep_indices.extend(kept)
+        total_kept += len(kept)
+        new_episode_ends.append(total_kept)
+
+    keep_indices = np.array(keep_indices, dtype=np.int64)
+    new_episode_ends = np.array(new_episode_ends, dtype=np.int64)
+    print(f"\nAfter trim: {total_kept} frames, episode_ends={new_episode_ends}\n")
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     pca_l, emb_l = fit_pca_single(src_root, 'robot0_tactile_left',  'digit_pca_left',  args.pca_dim, script_dir)
     pca_r, emb_r = fit_pca_single(src_root, 'robot0_tactile_right', 'digit_pca_right', args.pca_dim, script_dir)
 
-    write_dst_zarr(args.dst, src_root, emb_l, emb_r, episode_ends)
+    write_dst_zarr(args.dst, src_root, emb_l, emb_r, new_episode_ends, keep_indices)
 
     # Save PCA matrices (needed at inference time for online embedding)
     for pca, name in [(pca_l, 'digit_pca_left'), (pca_r, 'digit_pca_right')]:
