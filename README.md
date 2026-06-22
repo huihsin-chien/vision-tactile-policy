@@ -1,65 +1,115 @@
 # vision-tactile-policy
 
-> 🚧 **Work in Progress** — data collection ongoing
+> 🚧 **Work in Progress** — currently in data collection phase.
 
-**UMI + DIGIT tactile adaptation of [ImplicitRDP](https://implicit-rdp.github.io)**  
-Independent research — Lydia Chien @ NYCU EE · Jan 2026 – Present
+Adapting [ImplicitRDP](https://implicit-rdp.github.io/)'s slow-fast diffusion policy to use **UMI hand-held demonstrations** with **dual DIGIT tactile sensors** — targeting contact-aware grasping of fragile objects (egg, tofu, test tube).
 
----
+## Motivation
 
-## What This Is
+Fragile object manipulation requires knowing *how hard* you're gripping. Visual feedback alone isn't enough — this project adds tactile sensing to the fast-path temporal conditioning of ImplicitRDP, replacing the Flexiv-specific wrist F/T sensor with commodity tactile sensors.
 
-This repo adapts ImplicitRDP's slow-fast diffusion policy for a **UMI + DIGIT tactile** setup — replacing the original Flexiv force/torque sensor with dual-DIGIT tactile sensors, and the impedance-control action space with a position-controlled 7-DOF action space compatible with UMI hand-held demonstrations.
+## Architecture
 
-**Goal:** learn a contact-aware grasping policy for fragile objects (egg, tofu, test tube), using tactile feedback as the reactive signal.
+ImplicitRDP uses a **slow-fast** diffusion policy:
+- **Slow path**: diffusion transformer over visual + proprioceptive observations
+- **Fast path**: GRU that conditions on high-frequency sensor data → temporal embedding injected into the slow path
 
----
+Our adaptation replaces the fast-path sensor:
 
-## Key Adaptations from Original ImplicitRDP
-
-| Component | Original (SJTU) | This Fork |
-|---|---|---|
-| Robot | Flexiv Rizon 4s | UMI hand-held + position-ctrl arm |
-| Fast-path sensor | 6-DOF wrist wrench | Dual DIGIT tactile (PCA, dim=64) |
-| Action space | 19D (xyz + 6d\_rot + virtual + stiffness) | 7D (xyz + axis\_angle + gripper) |
-| Data collection | Kinematic teaching | UMI GoPro + DIGIT sync |
-| Tactile encoder | — | SparSH ViT *(planned)* |
-
-### Fast-path GRU
-
-```python
-# Original: 6D wrench → GRU → temporal conditioning
-GRU(input_dim=6,  hidden_dim=512) → Linear(512→768)
-
-# This fork: dual-DIGIT PCA → GRU → temporal conditioning
-GRU(input_dim=64, hidden_dim=512) → Linear(512→768)
-# input_dim = pca_dim(32) × 2 DIGIT sensors
+```
+Original (Flexiv):  wrench F/T (6D)       → GRU(6, 512)  → Linear(512→768)
+Ours (UMI+DIGIT):   dual-DIGIT PCA (64D)  → GRU(64, 512) → Linear(512→768)
+                    └── pca_dim=32 × 2 sensors
 ```
 
-### Data sync pipeline
+Action space: **19D** (Flexiv joint impedance) → **7D** (xyz + axis_angle + gripper) for position-controlled arms.
 
-Clapperboard-analog sync: pressure spike on DIGIT → detect Δt → align GoPro video + tactile streams.
+```python
+# config/task/umi_digit.yaml
+action_dim: 7            # xyz(3) + axis_angle(3) + gripper(1)
+tactile_pca_dim: 32      # per DIGIT sensor
+fast_path_input_dim: 64  # 32 * 2 sensors
+```
 
-*Demo: data collection video — coming soon*
+## Data Collection
 
----
+**Hardware**: UMI gripper + GoPro (3rd-person) + 2× DIGIT tactile sensors (fingertips)
 
-## Planned: SparSH Tactile Encoder
+**Sync**: Pressure spike on DIGIT at grasp start → detect Δt → align GoPro video + dual tactile streams offline.
 
-Cross-attention fusion of SparSH tactile tokens into the slow-path Diffusion Transformer:
-- Assign `SparshViTWrapper` in `TransformerObsEncoder` for DIGIT image keys
-- Output: `(BT, 196, 384)` tokens → projected to 768-dim, concat with visual tokens
+**Target objects**: egg · tofu · test tube
 
----
+## Planned: SparSH Integration
+
+Replace the `timm` ViT backbone in `TransformerObsEncoder` with a `SparshViTWrapper` for DIGIT image keys — cross-attention fusion of tactile tokens with visual tokens into the slow-path diffusion transformer.
+
+```python
+# Instead of:
+encoder = TimmViT(model_name="vit_base_patch16_224")
+
+# Use:
+encoder = SparshViTWrapper(
+    pretrained="sparsh-base",
+    tactile_keys=["digit_left", "digit_right"],
+    fusion="cross_attention",
+)
+```
 
 ## Evaluation (planned)
 
-Ablation: **w/ tactile** vs **w/o tactile** on fragile object grasping  
-Objects: egg · tofu · test tube
+Ablation study: **w/ tactile** vs. **w/o tactile** on fragile grasping.
+
+| Object    | w/ tactile | w/o tactile |
+|-----------|------------|-------------|
+| Egg       | TBD        | TBD         |
+| Tofu      | TBD        | TBD         |
+| Test tube | TBD        | TBD         |
+
+## Repository Structure
+
+```
+vision-tactile-policy/
+├── config/
+│   ├── task/umi_digit.yaml         # action/obs space config
+│   └── model/slow_fast_digit.yaml  # fast-path GRU config
+├── models/
+│   ├── fast_path_gru.py            # dual-DIGIT PCA → GRU
+│   ├── sparsh_wrapper.py           # (planned) SparSH ViT adapter
+│   └── policy.py                   # slow-fast diffusion policy
+├── data_collection/
+│   ├── sync_streams.py             # GoPro + DIGIT sync via pressure spike
+│   └── pca_fit.py                  # fit PCA on DIGIT tactile images
+└── CLAUDE.md                       # technical context for AI assistants
+```
+
+## Dependencies
+
+```bash
+pip install torch torchvision
+pip install git+https://github.com/facebookresearch/digit-interface
+pip install git+https://github.com/columbia-ai-robotics/umi
+# SparSH (planned)
+pip install git+https://github.com/facebookresearch/sparsh
+```
+
+## Related Work
+
+- [ImplicitRDP](https://implicit-rdp.github.io/) — original slow-fast diffusion policy (Flexiv)
+- [UMI](https://umi-gripper.github.io/) — hand-held demonstration system
+- [DIGIT](https://digit.ml/) — compact tactile sensor by Meta AI
+- [SparSH](https://sparsh-ssl.github.io/) — tactile representation learning
+
+## Status
+
+| Component | Status |
+|-----------|--------|
+| Architecture adaptation (7D action, dual-DIGIT GRU) | ✅ Done |
+| Data collection pipeline (sync) | ✅ Done |
+| Training data collection | 🔄 In progress |
+| Policy training | ⏳ Pending |
+| SparSH integration | ⏳ Planned |
+| Real-robot evaluation | ⏳ Planned |
 
 ---
 
-## Base Paper
-
-> Chen et al., "ImplicitRDP: An End-to-End Visual-Force Diffusion Policy with Structural Slow-Fast Learning," arXiv:2512.10946, 2025.  
-> Project: https://implicit-rdp.github.io🚧——·–——
+**Lydia Chien** · NYCU EE · Independent Research · 2026
